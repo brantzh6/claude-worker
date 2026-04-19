@@ -258,7 +258,7 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
                 resolved = _resolve_claude_binary("claude")
                 self.assertEqual(resolved, "C:\\path\\claude.cmd")
 
-    def test_timeout_path_terminates_kills_and_finalizes(self) -> None:
+    def test_timeout_path_returns_running_without_killing(self) -> None:
         class TimeoutThenFailProcess:
             def __init__(self) -> None:
                 self.returncode = None
@@ -289,21 +289,63 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
             runtime = ClaudeWorkerRuntime(run_root=tmpdir, launcher=lambda *args, **kwargs: TimeoutThenFailProcess())
             record = runtime.start(WorkerPacket(kind="coding", prompt="Hang test", cwd=tmpdir))
             result = runtime.wait(record.run_id)
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["returncode"], 124)
-            self.assertIn("Timed out", result["stderr"])
-            self.assertEqual(
-                result["lifecycle"],
-                {"timeout": True, "terminate_requested": True, "kill_requested": True, "kill_grace_period_seconds": 5},
-            )
-            self.assertTrue(record.process.terminated)
-            self.assertTrue(record.process.killed)
-            self.assertTrue((record.run_dir / "final.json").exists())
+            # New behavior: wait timeout returns running, does NOT terminate
+            self.assertEqual(result["status"], "running")
+            self.assertTrue(result["lifecycle"]["timeout"])
+            self.assertFalse(result["lifecycle"]["terminate_requested"])
+            self.assertFalse(result["lifecycle"]["kill_requested"])
+            self.assertFalse(record.process.terminated)
+            self.assertFalse(record.process.killed)
+            # No final.json — process is still alive
+            self.assertFalse((record.run_dir / "final.json").exists())
             events = (record.run_dir / "events.ndjson").read_text(encoding="utf-8")
-            self.assertIn('"event": "terminate_requested"', events)
-            self.assertIn('"event": "kill_requested"', events)
+            self.assertIn('"event": "wait_timeout"', events)
+            self.assertNotIn('"event": "terminate_requested"', events)
 
-    def test_live_hanging_subprocess_times_out_and_records_lifecycle(self) -> None:
+    def test_timeout_then_abort_terminates_and_finalizes(self) -> None:
+        """wait() timeout returns running; subsequent abort() terminates and finalizes."""
+        class TimeoutThenCompleteProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                self._calls = 0
+
+            def communicate(self, timeout: int | None = None):
+                self._calls += 1
+                if self._calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
+                return "", ""
+
+            def wait(self, timeout: int | None = None):
+                self.returncode = 0
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = 143
+
+            def kill(self):
+                self.killed = True
+                self.returncode = 137
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = ClaudeWorkerRuntime(run_root=tmpdir, launcher=lambda *args, **kwargs: TimeoutThenCompleteProcess())
+            record = runtime.start(WorkerPacket(kind="coding", prompt="Timeout then abort", cwd=tmpdir))
+            # First wait: timeout → running
+            result = runtime.wait(record.run_id)
+            self.assertEqual(result["status"], "running")
+            self.assertFalse(record.process.terminated)
+            # Now abort
+            aborted = runtime.abort(record.run_id)
+            self.assertEqual(aborted["status"], "aborted")
+            self.assertTrue(record.process.terminated)
+            self.assertTrue((record.run_dir / "final.json").exists())
+
+    def test_live_hanging_subprocess_times_out_and_returns_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             def launcher(*args, **kwargs):
                 return subprocess.Popen(
@@ -328,15 +370,18 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
                 )
             )
             result = runtime.wait(record.run_id)
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["returncode"], 124)
-            self.assertIn("Timed out", result["stderr"])
+            # New behavior: timeout returns running, child is NOT terminated
+            self.assertEqual(result["status"], "running")
             self.assertTrue(result["lifecycle"]["timeout"])
-            self.assertTrue(result["lifecycle"]["terminate_requested"])
-            self.assertTrue((record.run_dir / "final.json").exists())
+            self.assertFalse(result["lifecycle"]["terminate_requested"])
+            # No final.json — process is still alive
+            self.assertFalse((record.run_dir / "final.json").exists())
             events = (record.run_dir / "events.ndjson").read_text(encoding="utf-8")
             self.assertIn('"event": "wait_timeout"', events)
-            self.assertIn('"event": "terminate_requested"', events)
+            self.assertNotIn('"event": "terminate_requested"', events)
+            # Clean up: abort the still-running process
+            aborted = runtime.abort(record.run_id)
+            self.assertEqual(aborted["status"], "aborted")
 
     def test_detached_wait_returns_running_snapshot_and_abort_requires_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -758,17 +803,19 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
                 )
             )
             result = runtime.wait(record.run_id)
-            self.assertEqual(result["status"], "failed")
+            # New behavior: timeout returns running, not failed
+            self.assertEqual(result["status"], "running")
             events = (record.run_dir / "events.ndjson").read_text(encoding="utf-8")
             self.assertIn('"event": "wait_communicate_start"', events)
             self.assertIn('"event": "wait_timeout"', events)
-            self.assertIn('"event": "terminate_requested"', events)
-            # kill_requested may or may not appear depending on whether terminate succeeds within grace period
+            # No terminate_requested — process is left alive
+            self.assertNotIn('"event": "terminate_requested"', events)
             self.assertTrue(result["lifecycle"]["timeout"])
-            self.assertTrue(result["lifecycle"]["terminate_requested"])
-            self.assertEqual(result["lifecycle"]["kill_grace_period_seconds"], 0.1)
+            self.assertFalse(result["lifecycle"]["terminate_requested"])
+            # Clean up
+            runtime.abort(record.run_id)
 
-    def test_kill_grace_period_is_respected(self) -> None:
+    def test_kill_grace_period_is_respected_on_abort(self) -> None:
         class TimeoutOnlyProcess:
             def __init__(self) -> None:
                 self.returncode = None
@@ -778,9 +825,7 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
 
             def communicate(self, timeout: int | None = None):
                 self._communicate_count += 1
-                if self._communicate_count == 1:
-                    raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
-                if self._communicate_count == 2:
+                if self._communicate_count <= 2:
                     raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
                 return "", ""
 
@@ -804,9 +849,14 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
                 launcher=lambda *args, **kwargs: TimeoutOnlyProcess(),
             )
             record = runtime.start(WorkerPacket(kind="coding", prompt="Grace period test", cwd=tmpdir))
+            # First wait() returns running on timeout — does NOT terminate
             result = runtime.wait(record.run_id)
-            self.assertEqual(result["lifecycle"]["kill_grace_period_seconds"], 0.01)
-            self.assertTrue(result["lifecycle"]["timeout"])
+            self.assertEqual(result["status"], "running")
+            self.assertFalse(record.process.terminated)
+            self.assertFalse(record.process.killed)
+            # Then abort() terminates and kills
+            aborted = runtime.abort(record.run_id)
+            self.assertEqual(aborted["status"], "aborted")
             self.assertTrue(record.process.terminated)
             self.assertTrue(record.process.killed)
 

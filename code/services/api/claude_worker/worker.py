@@ -1672,8 +1672,6 @@ class ClaudeWorkerRuntime:
         try:
             stdout, stderr = record.process.communicate(timeout=self.wait_timeout_seconds)
         except subprocess.TimeoutExpired:
-            terminated = False
-            killed = False
             _append_event(
                 record.run_dir / "events.ndjson",
                 {
@@ -1683,47 +1681,11 @@ class ClaudeWorkerRuntime:
                     "at": _utc_now().isoformat(),
                 },
             )
-            if hasattr(record.process, "terminate"):
-                record.process.terminate()
-                terminated = True
-                _append_event(
-                    record.run_dir / "events.ndjson",
-                    {"event": "terminate_requested", "run_id": run_id, "grace_period_seconds": self.kill_grace_period_seconds, "at": _utc_now().isoformat()},
-                )
-            try:
-                stdout, stderr = record.process.communicate(timeout=self.kill_grace_period_seconds)
-            except Exception:
-                if hasattr(record.process, "kill"):
-                    record.process.kill()
-                    killed = True
-                    _append_event(
-                        record.run_dir / "events.ndjson",
-                        {"event": "kill_requested", "run_id": run_id, "at": _utc_now().isoformat()},
-                    )
-                try:
-                    stdout, stderr = record.process.communicate(timeout=self.kill_grace_period_seconds)
-                except Exception:
-                    if hasattr(record.process, "wait"):
-                        try:
-                            record.process.wait(timeout=1)
-                        except Exception:
-                            pass
-                    stdout, stderr = "", ""
-            stdout = stdout or ""
-            stderr = (stderr or "") + f"\nTimed out after {self.wait_timeout_seconds} seconds"
-            return self._finalize(
-                record,
-                stdout,
-                stderr,
-                status="failed",
-                returncode=124,
-                lifecycle={
-                    "timeout": True,
-                    "terminate_requested": terminated,
-                    "kill_requested": killed,
-                    "kill_grace_period_seconds": self.kill_grace_period_seconds,
-                },
-            )
+            # Wait timeout means the *controller* got tired of waiting,
+            # NOT that the child should die. Return running status so
+            # the controller can fetch() later or abort() if desired.
+            return self._wait_timeout_running(record)
+
         _append_event(
             record.run_dir / "events.ndjson",
             {"event": "wait_communicate_done", "run_id": run_id, "at": _utc_now().isoformat()},
@@ -1732,6 +1694,78 @@ class ClaudeWorkerRuntime:
         status = "succeeded" if returncode == 0 else "failed"
         stdout, stderr = self._read_wait_artifacts(record, stdout or "", stderr or "")
         return self._finalize(record, stdout or "", stderr or "", status=status, returncode=returncode)
+
+    def _wait_timeout_running(self, record: RunRecord) -> dict[str, Any]:
+        """Return a running snapshot when wait() times out without killing the child.
+
+        The child process is left alive. The controller can:
+        - Call fetch(run_id) again later to collect the result
+        - Call abort(run_id) to terminate the child
+        """
+        meta_path = record.run_dir / "meta.json"
+        meta = _read_json(meta_path) if meta_path.exists() else {}
+        return {
+            "run_id": record.run_id,
+            "kind": record.packet.kind,
+            "task_id": record.packet.task_id,
+            "title": record.packet.title,
+            "status": "running",
+            "recommendation": "accept_with_changes",
+            "lifecycle": {
+                "timeout": True,
+                "terminate_requested": False,
+                "kill_requested": False,
+                "message": f"wait() timed out after {self.wait_timeout_seconds}s; child process is still running. Use fetch() to retry or abort() to terminate.",
+            },
+            "owner_pid": meta.get("owner_pid"),
+            "child_pid": meta.get("child_pid"),
+        }
+
+    def _wait_timeout_terminate(self, record: RunRecord) -> dict[str, Any]:
+        """Legacy behavior: terminate child on wait timeout. Used only via abort() or explicit policy."""
+        terminated = False
+        killed = False
+        if hasattr(record.process, "terminate"):
+            record.process.terminate()
+            terminated = True
+            _append_event(
+                record.run_dir / "events.ndjson",
+                {"event": "terminate_requested", "run_id": record.run_id, "grace_period_seconds": self.kill_grace_period_seconds, "at": _utc_now().isoformat()},
+            )
+        try:
+            stdout, stderr = record.process.communicate(timeout=self.kill_grace_period_seconds)
+        except Exception:
+            if hasattr(record.process, "kill"):
+                record.process.kill()
+                killed = True
+                _append_event(
+                    record.run_dir / "events.ndjson",
+                    {"event": "kill_requested", "run_id": record.run_id, "at": _utc_now().isoformat()},
+                )
+            try:
+                stdout, stderr = record.process.communicate(timeout=self.kill_grace_period_seconds)
+            except Exception:
+                if hasattr(record.process, "wait"):
+                    try:
+                        record.process.wait(timeout=1)
+                    except Exception:
+                        pass
+                stdout, stderr = "", ""
+        stdout = stdout or ""
+        stderr = (stderr or "") + f"\nTimed out after {self.wait_timeout_seconds} seconds"
+        return self._finalize(
+            record,
+            stdout,
+            stderr,
+            status="failed",
+            returncode=124,
+            lifecycle={
+                "timeout": True,
+                "terminate_requested": terminated,
+                "kill_requested": killed,
+                "kill_grace_period_seconds": self.kill_grace_period_seconds,
+            },
+        )
 
     def abort(self, run_id: str) -> dict[str, Any]:
         record = self._get_record(run_id)
