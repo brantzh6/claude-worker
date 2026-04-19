@@ -133,7 +133,7 @@ SESSIONS_DIR_NAME = "sessions"
 VALID_EXECUTION_MODES = ("one_shot", "interactive", "detached")
 DEFAULT_EXECUTION_MODE = "one_shot"
 PROVIDERS_FILENAME = "providers.json"
-CREDENTIALS_DIR_NAME = ".claude-worker"
+CONFIG_DIR_NAME = "config"
 CREDENTIALS_DB_FILENAME = "credentials.db"
 CLAUDE_SETTINGS_DIR_NAME = ".claude"
 CLAUDE_SETTINGS_FILENAME = "settings.json"
@@ -408,31 +408,35 @@ def _claude_settings_path() -> Path:
 
 
 def _providers_db_path() -> Path:
-    override = os.environ.get("IKE_CLAUDE_WORKER_ROOT")
-    if override:
-        return Path(override).expanduser().resolve() / PROVIDERS_FILENAME
-    return (_repo_root().parent / "_agent-runtimes" / "claude-worker" / PROVIDERS_FILENAME).resolve()
+    return _default_claude_worker_root() / CONFIG_DIR_NAME / PROVIDERS_FILENAME
 
 
-def _default_credentials_dir() -> Path:
-    override = os.environ.get("IKE_CLAUDE_WORKER_ROOT")
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path.home() / CREDENTIALS_DIR_NAME
+def _default_credentials_path() -> Path:
+    return _default_claude_worker_root() / CREDENTIALS_DB_FILENAME
 
 
 class CredentialStore:
     """Encrypted credential store for provider API keys.
 
-    Storage: SQLite DB at ~/.claude-worker/credentials.db
+    Storage: SQLite DB at <runtime-root>/credentials.db
     Schema:  credentials(provider_name TEXT PK, key_type TEXT, encrypted_value TEXT, salt TEXT)
     Encryption: XOR with key derived from SHA-256(username + hostname + salt), then base64-encoded.
     This is obfuscation (not cryptographic-grade), but prevents plaintext reading of the DB file.
     """
 
     def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or (_default_credentials_dir() / CREDENTIALS_DB_FILENAME)
+        self.db_path = db_path or _default_credentials_path()
+        self._migrate_from_legacy_path()
         self._ensure_db()
+
+    def _migrate_from_legacy_path(self) -> None:
+        """One-time migration: if new path doesn't exist but legacy ~/.claude-worker/ does, copy it."""
+        if self.db_path.exists():
+            return
+        legacy = Path.home() / ".claude-worker" / CREDENTIALS_DB_FILENAME
+        if legacy.exists():
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(legacy), str(self.db_path))
 
     def _ensure_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -621,7 +625,17 @@ class ProviderRegistry:
         self.db_path = Path(db_path) if db_path else _providers_db_path()
         self.cred_store = cred_store or CredentialStore()
         self._providers: dict[str, ProviderConfig] = {}
+        self._migrate_from_legacy_path()
         self._load()
+
+    def _migrate_from_legacy_path(self) -> None:
+        """One-time migration: if new config/ path doesn't exist but old root-level one does, move it."""
+        if self.db_path.exists():
+            return
+        legacy = _default_claude_worker_root() / PROVIDERS_FILENAME
+        if legacy.exists():
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(self.db_path))
 
     def _load(self) -> None:
         # providers.json is the single source of truth.
@@ -676,7 +690,7 @@ class ProviderRegistry:
         """Resolve credentials for a provider and produce env vars to write to settings.json.
 
         Credential resolution order (first non-empty wins):
-          1. CredentialStore (~/.claude-worker/credentials.db) — our own encrypted DB
+          1. CredentialStore (<runtime-root>/credentials.db) — our own encrypted DB
           2. os.environ (explicit environment variables, e.g. ANTHROPIC_API_KEY, ZAI_API_KEY)
           3. cc-switch SQLite DB (legacy fallback, matched by name mapping)
           4. ~/.claude/settings.json (current active env — last resort)
