@@ -1057,6 +1057,42 @@ class ClaudeWorkerRuntimeTest(unittest.TestCase):
             events = (record.run_dir / "events.ndjson").read_text(encoding="utf-8")
             self.assertIn('"event": "prompt_delivery_verified"', events)
 
+    def test_prompt_with_newlines_passes_verification_on_windows(self) -> None:
+        """Prompt files with newlines must survive CRLF-free verification on Windows."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Multi-line prompt with many \n characters
+            prompt_content = "Line one\nLine two\nLine three\nLine four\n"
+            launched_order = []
+
+            def launcher(command, **kwargs):
+                launched_order.append("launched")
+                return FakeProcess(
+                    json.dumps(
+                        {
+                            "summary": "Multi-line prompt delivered.",
+                            "files_changed": [],
+                            "validation_run": "",
+                            "known_risks": [],
+                            "recommendation": "accept",
+                        }
+                    )
+                )
+
+            runtime = ClaudeWorkerRuntime(run_root=tmpdir, launcher=launcher)
+            record = runtime.start(
+                WorkerPacket(kind="coding", prompt=prompt_content, cwd=tmpdir)
+            )
+            # On Windows, write_text without newline="" would convert \n to \r\n,
+            # causing st_size to exceed len(encode("utf-8")) and breaking verification.
+            meta = json.loads((record.run_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertTrue(
+                meta["prompt_delivery"]["prompt_file_verified_after_start"],
+                f"Prompt verification failed: disk_size={record.run_dir.joinpath(PROMPT_FILENAME).stat().st_size}, "
+                f"expected_size={meta['prompt_delivery']['prompt_file_size']}",
+            )
+            events = (record.run_dir / "events.ndjson").read_text(encoding="utf-8")
+            self.assertIn('"event": "prompt_delivery_verified"', events)
+
     def test_effort_flag_passed_to_cc_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             launched = {}

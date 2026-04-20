@@ -183,7 +183,9 @@ def _ensure_parent(path: Path) -> None:
 
 def _write_text(path: Path, content: str) -> None:
     _ensure_parent(path)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, encoding="utf-8", newline="")
+    # newline="" prevents OS line-ending translation (CRLF on Windows),
+    # ensuring len(content.encode("utf-8")) == st_size for verification.
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -1494,7 +1496,7 @@ class ClaudeWorkerRuntime:
         prompt_delivery = {
             "method": "file_and_stdin",
             "prompt_file": str(prompt_path),
-            "prompt_file_size": len(packet.prompt.encode("utf-8")),
+            "prompt_file_size": prompt_path.stat().st_size,  # Use actual disk size, not len(encode), to survive CRLF or BOM
             "prompt_file_written_at": _utc_now().isoformat(),
             "mode": execution_mode,
         }
