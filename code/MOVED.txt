@@ -1,0 +1,3 @@
+MOVED
+
+All code has been relocated to `runners/claudecode/code/` as part of the IEF-Runners restructure (April 2026).
